@@ -14,6 +14,7 @@ Each acquired slot is stored as a member in a Redis sorted set, scored by its ex
 - **Release** — atomic Lua script: removes the slot by ID, cleans up any other expired slots as a side effect.
 - **Fail-open** — if Redis is unreachable, `TryAcquire` returns `Acquired: true` with a sentinel slot ID so the caller is never blocked by infrastructure downtime.
 - **Per-project limits** — optionally supply a `planFn` to resolve a dynamic limit per project ID, with a 1-minute in-process cache.
+- **Embedded scripts** — Lua scripts are compiled into the binary via `//go:embed`; no `scripts/` directory needed at runtime.
 
 ## Installation
 
@@ -34,16 +35,20 @@ import (
 
     "github.com/ashfaqjani916/gotsem"
     "github.com/redis/go-redis/v9"
+    "go.uber.org/zap"
 )
 
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 
+logger, _ := zap.NewProduction()
+
 sem := gotsem.NewGotsem(
     rdb,
-    "sem:",        // key prefix — keys will be like "sem:<projectID>"
-    30*time.Second, // slot TTL — how long a slot is held if Release is never called
-    10,            // default max concurrent slots per project
-    nil,           // planFn — pass nil to always use defaultMax
+    "sem:",          // key prefix — Redis keys will be "sem:<ID>"
+    30*time.Second,  // slot TTL — max time a slot is held if Release is never called
+    10,              // default max concurrent slots per ID
+    nil,             // planFn — pass nil to always use defaultMax
+    logger.Sugar(),  // pass nil to silence all logs
 )
 ```
 
@@ -66,32 +71,40 @@ func handleRequest(ctx context.Context, projectID string) error {
 
 ### Dynamic per-project limits
 
-Supply a `planFn` to look up the limit for a project at runtime (e.g. from a database or billing tier). Results are cached for 1 minute per project ID.
+Supply a `planFn` to look up the limit for a project at runtime (e.g. from a database or billing tier). Results are cached for 1 minute per project ID. Return `0` or a negative value to fall back to `defaultMax`.
 
 ```go
-planFn := func(ctx context.Context, projectID string) int {
-    // return 0 or negative to fall back to defaultMax
-    return db.GetConcurrencyLimit(ctx, projectID)
+planFn := func(ctx context.Context, id string) (int, error) {
+    return db.GetConcurrencyLimit(ctx, id)
 }
 
-sem := gotsem.NewGotsem(rdb, "sem:", 30*time.Second, 5, planFn)
+sem := gotsem.NewGotsem(rdb, "sem:", 30*time.Second, 5, planFn, nil)
+```
+
+### Emergency drain
+
+`ForceRelease` drops all active slots for an ID unconditionally. Useful when a deployment is stuck or slots have leaked.
+
+```go
+sem.ForceRelease(ctx, projectID)
 ```
 
 ### Observability
 
 ```go
 active := sem.ActiveCount(ctx, projectID)
-fmt.Printf("project %s has %d active slots\n", projectID, active)
+fmt.Printf("%s has %d active slots\n", projectID, active)
 ```
 
 ## API
 
 | Method | Description |
 |---|---|
-| `NewGotsem(rdb, keyPrefix, slotTTL, defaultMax, planFn)` | Create a new semaphore instance |
-| `TryAcquire(ctx, projectID) AcquireResult` | Non-blocking attempt to acquire a slot |
-| `Release(ctx, projectID, slotID)` | Release a previously acquired slot |
-| `ActiveCount(ctx, projectID) int` | Current number of active slots for a project |
+| `NewGotsem(rdb, keyPrefix, slotTTL, defaultMax, planFn, logger)` | Create a new semaphore instance |
+| `TryAcquire(ctx, id) AcquireResult` | Non-blocking attempt to acquire a slot |
+| `Release(ctx, id, slotID)` | Release a previously acquired slot |
+| `ForceRelease(ctx, id)` | Drop all active slots for an ID unconditionally |
+| `ActiveCount(ctx, id) int` | Current number of active slots for an ID |
 
 ### `AcquireResult`
 
@@ -109,3 +122,4 @@ type AcquireResult struct {
 - Go 1.21+
 - Redis 7+
 - [`github.com/redis/go-redis/v9`](https://github.com/redis/go-redis)
+- [`go.uber.org/zap`](https://github.com/uber-go/zap)
