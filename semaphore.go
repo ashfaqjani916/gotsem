@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"strconv"
 	"sync"
 	"time"
 
@@ -92,6 +93,34 @@ func (s *Semaphore) limitFor(ctx context.Context, projectID string) int {
 	}
 	s.planCache.Store(projectID, planCacheEntry{limit, time.Now().Add(time.Minute)})
 	return limit
+}
+
+// Release frees the slot. Always call via defer.
+// Uses context.WithoutCancel so it fires even if the request context was cancelled
+// (client disconnected, timeout, etc).
+func (s *Semaphore) Release(ctx context.Context, projectID, slotID string) {
+	if slotID == "failopen" {
+		return // Redis was down on acquire, nothing to release
+	}
+	key := s.keyPrefix + projectID
+	now := time.Now().UnixMilli()
+
+	luaRelease, err := LoadRelease()
+	if err != nil {
+		panic(err)
+	}
+	// Detach from request context — must succeed even if client disconnected
+	luaRelease.Run(context.WithoutCancel(ctx), s.rdb, []string{key}, slotID, now)
+}
+
+// ActiveCount returns the number of currently held slots for a project.
+// Useful for metrics/dashboards.
+func (s *Semaphore) ActiveCount(ctx context.Context, projectID string) int {
+	key := s.keyPrefix + projectID
+	now := time.Now().UnixMilli()
+	s.rdb.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(now, 10))
+	count, _ := s.rdb.ZCard(ctx, key).Result()
+	return int(count)
 }
 
 func newSlotID() string {
