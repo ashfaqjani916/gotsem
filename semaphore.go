@@ -60,11 +60,7 @@ func (s *Semaphore) TryAcquire(ctx context.Context, ID string) AcquireResult {
 
 	slotID := newSlotID()
 
-	luaAcquire, err := LoadAquire()
-	if err != nil {
-		s.log.Errorw("failed to load acquire script", "error", err)
-		return AcquireResult{Acquired: true, SlotID: "failopen", Active: 0, Max: max}
-	}
+	luaAcquire := LoadAquire()
 
 	result, err := luaAcquire.Run(ctx, s.rdb,
 		[]string{key},
@@ -115,11 +111,7 @@ func (s *Semaphore) Release(ctx context.Context, ID, slotID string) {
 	key := s.keyPrefix + ID
 	now := time.Now().UnixMilli()
 
-	luaRelease, err := LoadRelease()
-	if err != nil {
-		s.log.Errorw("failed to load release script", "id", ID, "slotID", slotID, "error", err)
-		return
-	}
+	luaRelease := LoadRelease()
 	// Detach from request context — must succeed even if client disconnected
 	if err := luaRelease.Run(context.WithoutCancel(ctx), s.rdb, []string{key}, slotID, now).Err(); err != nil {
 		s.log.Warnw("redis release failed", "id", ID, "slotID", slotID, "error", err)
