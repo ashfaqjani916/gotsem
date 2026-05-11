@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 )
 
 type Semaphore struct {
@@ -18,6 +18,7 @@ type Semaphore struct {
 	slotTTL    time.Duration
 	defaultMax int
 	planFn     func(ctx context.Context, ID string) (limit int, err error)
+	log        *zap.SugaredLogger
 	// local cache so planFn isn't called on every request
 	planCache sync.Map // projectID → planCacheEntry
 }
@@ -34,13 +35,17 @@ type planCacheEntry struct {
 	exp   time.Time
 }
 
-func NewGotsem(rdb redis.UniversalClient, keyPrefix string, slotTTL time.Duration, defaultMax int, planFn func(ctx context.Context, ID string) (limit int, err error)) *Semaphore {
+func NewGotsem(rdb redis.UniversalClient, keyPrefix string, slotTTL time.Duration, defaultMax int, planFn func(ctx context.Context, ID string) (limit int, err error), logger *zap.SugaredLogger) *Semaphore {
+	if logger == nil {
+		logger = zap.NewNop().Sugar()
+	}
 	return &Semaphore{
 		rdb:        rdb,
 		keyPrefix:  keyPrefix,
 		slotTTL:    slotTTL,
 		defaultMax: defaultMax,
 		planFn:     planFn,
+		log:        logger,
 	}
 }
 
@@ -57,7 +62,8 @@ func (s *Semaphore) TryAcquire(ctx context.Context, ID string) AcquireResult {
 
 	luaAcquire, err := LoadAquire()
 	if err != nil {
-		panic(err)
+		s.log.Errorw("failed to load acquire script", "error", err)
+		return AcquireResult{Acquired: true, SlotID: "failopen", Active: 0, Max: max}
 	}
 
 	result, err := luaAcquire.Run(ctx, s.rdb,
@@ -66,7 +72,7 @@ func (s *Semaphore) TryAcquire(ctx context.Context, ID string) AcquireResult {
 	).Int64Slice()
 
 	if err != nil {
-		// Redis down → fail-open, return a sentinel slotID so Release is a no-op
+		s.log.Warnw("redis acquire failed, failing open", "id", ID, "error", err)
 		return AcquireResult{Acquired: true, SlotID: "failopen", Active: 0, Max: max}
 	}
 
@@ -90,7 +96,7 @@ func (s *Semaphore) limitFor(ctx context.Context, ID string) int {
 	}
 	limit, err := s.planFn(ctx, ID)
 	if err != nil {
-		fmt.Errorf("Failed to get limit")
+		s.log.Warnw("planFn failed, falling back to defaultMax", "id", ID, "error", err)
 	}
 	if limit <= 0 {
 		limit = s.defaultMax
@@ -111,10 +117,13 @@ func (s *Semaphore) Release(ctx context.Context, ID, slotID string) {
 
 	luaRelease, err := LoadRelease()
 	if err != nil {
-		panic(err)
+		s.log.Errorw("failed to load release script", "id", ID, "slotID", slotID, "error", err)
+		return
 	}
 	// Detach from request context — must succeed even if client disconnected
-	luaRelease.Run(context.WithoutCancel(ctx), s.rdb, []string{key}, slotID, now)
+	if err := luaRelease.Run(context.WithoutCancel(ctx), s.rdb, []string{key}, slotID, now).Err(); err != nil {
+		s.log.Warnw("redis release failed", "id", ID, "slotID", slotID, "error", err)
+	}
 }
 
 // ActiveCount returns the number of currently held slots for a project.
@@ -122,8 +131,14 @@ func (s *Semaphore) Release(ctx context.Context, ID, slotID string) {
 func (s *Semaphore) ActiveCount(ctx context.Context, ID string) int {
 	key := s.keyPrefix + ID
 	now := time.Now().UnixMilli()
-	s.rdb.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(now, 10))
-	count, _ := s.rdb.ZCard(ctx, key).Result()
+	if err := s.rdb.ZRemRangeByScore(ctx, key, "-inf", strconv.FormatInt(now, 10)).Err(); err != nil {
+		s.log.Warnw("failed to evict expired slots", "id", ID, "error", err)
+	}
+	count, err := s.rdb.ZCard(ctx, key).Result()
+	if err != nil {
+		s.log.Warnw("failed to get active count", "id", ID, "error", err)
+		return 0
+	}
 	return int(count)
 }
 
@@ -131,7 +146,11 @@ func (s *Semaphore) ActiveCount(ctx context.Context, ID string) int {
 // Use for admin/emergency drain — e.g. when a deploy is stuck or slots leaked.
 func (s *Semaphore) ForceRelease(ctx context.Context, ID string) {
 	key := s.keyPrefix + ID
-	s.rdb.Del(context.WithoutCancel(ctx), key)
+	if err := s.rdb.Del(context.WithoutCancel(ctx), key).Err(); err != nil {
+		s.log.Errorw("force release failed", "id", ID, "error", err)
+	} else {
+		s.log.Infow("force released all slots", "id", ID)
+	}
 }
 
 func newSlotID() string {
